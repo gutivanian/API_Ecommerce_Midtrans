@@ -5,5 +5,6 @@ const { getPayments, createPayment, checkTransactionStatus } = require('../contr
 router.get('/', getPayments);
 router.post('/', createPayment);
 router.get('/:order_number', checkTransactionStatus);
+router.post('/midtrans-notification', webhookController.handleWebhook);
 
 module.exports = router;

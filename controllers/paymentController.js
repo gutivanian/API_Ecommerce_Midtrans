@@ -1,8 +1,9 @@
 const pool = require('../config/db');
 const { convertToBase35 } = require('../utils/utils'); // Import fungsi konversi user_id
 const axios = require('axios');
+const crypto = require('crypto');
 
-
+const MIDTRANS_SERVER_KEY = process.env.MIDTRANS_SERVER_KEY;
 // Ambil semua pembayaran
 exports.getPayments = async (req, res) => {
     const result = await pool.query('SELECT * FROM payments');
@@ -256,4 +257,75 @@ exports.getPayments = async (req, res) => {
             res.status(500).json({ message: 'Error saat mengantri pembayaran', error });
         }
     };
+
+
+    exports.handleWebhook = async (req, res) => {
+        const notification = req.body;
     
+        try {
+            // Ambil data penting dari notifikasi
+            const { order_id, status_code, gross_amount, signature_key, transaction_status } = notification;
+    
+            // Verifikasi signature key
+            const input = order_id + status_code + gross_amount + MIDTRANS_SERVER_KEY;
+            const generatedSignature = crypto.createHash('sha512').update(input).digest('hex');
+    
+            if (generatedSignature !== signature_key) {
+                return res.status(401).json({ message: 'Invalid signature key' });
+            }
+    
+            // Perbarui status pembayaran di database
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+    
+                // Perbarui status pembayaran
+                const updatePaymentQuery = `
+                    UPDATE payments
+                    SET status = $1, settlement_time = $2
+                    WHERE order_id = (SELECT order_id FROM orders WHERE order_number = $3)
+                    RETURNING *;
+                `;
+                const updateResult = await client.query(updatePaymentQuery, [
+                    transaction_status,
+                    notification.settlement_time || null,
+                    order_id,
+                ]);
+    
+                if (updateResult.rows.length === 0) {
+                    await client.query('ROLLBACK');
+                    return res.status(404).json({ message: 'Order not found for update' });
+                }
+    
+                // Jika status transaksi gagal, expired, atau dibatalkan, kembalikan stok
+                if (['expire', 'cancel', 'deny'].includes(transaction_status)) {
+                    console.log(`Transaction ${order_id} failed. Returning stock...`);
+    
+                    const returnStockQuery = `
+                        UPDATE products
+                        SET stock = stock + (
+                            SELECT quantity FROM orders WHERE order_number = $1
+                        )
+                        WHERE product_id = (
+                            SELECT product_id FROM orders WHERE order_number = $1
+                        )
+                    `;
+                    await client.query(returnStockQuery, [order_id]);
+                }
+    
+                await client.query('COMMIT');
+    
+                console.log(`Transaction status for order ${order_id} updated successfully`);
+                res.status(200).json({ message: 'Transaction status updated successfully' });
+            } catch (error) {
+                await client.query('ROLLBACK');
+                console.error('Error updating payment status:', error);
+                res.status(500).json({ message: 'Failed to update payment status', error });
+            } finally {
+                client.release();
+            }
+        } catch (error) {
+            console.error('Error handling webhook:', error);
+            res.status(500).json({ message: 'Internal server error', error });
+        }
+    };    
