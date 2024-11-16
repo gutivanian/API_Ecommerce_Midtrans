@@ -261,6 +261,7 @@ exports.getPayments = async (req, res) => {
 
     exports.handleWebhook = async (req, res) => {
         const notification = req.body;
+        console.log(`Received webhook notification: ${JSON.stringify(notification)}`);
     
         try {
             // Ambil data penting dari notifikasi
