@@ -1,0 +1,147 @@
+// Membuat token SnapToken
+exports.createPayment = async (req, res) => {
+    let { order_number, amount, user_id } = req.body;
+    user_id = parseInt(user_id, 10);
+
+    try {
+        console.log(`Memulai pembuatan pembayaran untuk order_number: ${order_number}...`);
+        
+        await pool.query('BEGIN'); // Mulai transaksi
+
+        // Periksa apakah ada pembayaran pending sebelumnya
+        const preTransactionCheck = await pool.query(
+            'SELECT * FROM payments WHERE order_id = (SELECT order_id FROM orders WHERE order_number = $1) AND status = $2',
+            [order_number, 'Pending']
+        );
+        if (preTransactionCheck.rows.length > 0) {
+            console.log('Pembayaran pending sudah ada untuk order_number ini:', preTransactionCheck.rows);
+            await pool.query('ROLLBACK'); // Batalkan transaksi jika sudah ada pending payment
+            return res.json({
+                data: {
+                    snapToken: preTransactionCheck.rows[0].snap_token,
+                    midtransUrl: preTransactionCheck.rows[0].midtrans_url,
+                    expiredDate: preTransactionCheck.rows[0].expired_date,
+                    invoiceNumber: preTransactionCheck.rows[0].invoice_number
+                },
+                message: 'Transaksi pending yang sudah ada ditemukan'
+            });
+        }
+
+        // Mendapatkan order_id dan detail order (product_id, quantity)
+        const orderResult = await pool.query(
+            'SELECT order_id, product_id, quantity FROM orders WHERE order_number = $1 AND valid = true FOR UPDATE',
+            [order_number]
+        );
+        if (orderResult.rows.length === 0) {
+            await pool.query('ROLLBACK'); // Batalkan transaksi
+            console.log('Order sudah divalidasi atau tidak ditemukan.');
+            return res.status(404).json({ message: 'Order sudah tidak valid atau tidak ditemukan' });
+        }
+
+        const { order_id, product_id, quantity } = orderResult.rows[0];
+
+        // Update kolom valid di tabel orders
+        const updateOrder = await pool.query('UPDATE orders SET valid = false WHERE order_id = $1 RETURNING *', [order_id]);
+        if (updateOrder.rowCount === 0) {
+            await pool.query('ROLLBACK');
+            console.error('Gagal mengupdate status valid pada tabel orders');
+            return res.status(500).json({ message: 'Gagal mengupdate status order' });
+        }
+        console.log(`Order ${order_id} ditandai sebagai checked out (valid = false) - Update berhasil.`);
+
+        // Kurangi quantity di tabel products berdasarkan product_id
+        const updateProductQuantity = await pool.query(
+            'UPDATE products SET stock = stock - $1 WHERE product_id = $2 AND stock >= $1 RETURNING *',
+            [quantity, product_id]
+        );
+        if (updateProductQuantity.rowCount === 0) {
+            await pool.query('ROLLBACK');
+            console.error('Gagal mengurangi quantity produk atau stok tidak mencukupi');
+            return res.status(400).json({ message: 'Gagal mengurangi quantity produk atau stok tidak mencukupi' });
+        }
+        console.log(`Quantity untuk product_id ${product_id} berhasil dikurangi sebanyak ${quantity}.`);
+
+        // Ambil atau tingkatkan invoiceCount di CustInvoice
+        let invoiceCount;
+        const invoiceCheck = await pool.query(
+            'SELECT invoiceCount FROM CustInvoice WHERE user_id = $1',
+            [user_id]
+        );
+
+        const userCode = convertToBase35(user_id);
+
+        if (invoiceCheck.rows.length === 0) {
+            invoiceCount = 1;
+            await pool.query(
+                'INSERT INTO CustInvoice (user_id, userCode, invoiceCount) VALUES ($1, $2, $3)',
+                [user_id, userCode, invoiceCount]
+            );
+        } else {
+            invoiceCount = invoiceCheck.rows[0].invoicecount + 1;
+            await pool.query(
+                'UPDATE CustInvoice SET invoiceCount = $1 WHERE user_id = $2',
+                [invoiceCount, user_id]
+            );
+        }
+
+        // Format nomor invoice
+        const formattedInvoiceCount = invoiceCount < 10000 ? String(invoiceCount).padStart(4, '0') : invoiceCount;
+        const invoiceNumber = `INVFE-${userCode}-${formattedInvoiceCount}`;
+
+        // Menghitung tanggal kadaluarsa
+        const expiredDate = new Date(Date.now() + 60 * 60 * 1000);
+
+        const parameter = {
+            transaction_details: { order_id: order_number, gross_amount: Number(amount) },
+            credit_card: { secure: true },
+            customer_details: { user_id, email: `${user_id}@example.com`, phone: "08111222333" },
+            expiry: { start_time: new Date().toISOString().slice(0, 19).replace('T', ' ') + ' +0000', unit: 'minute', duration: 60 },
+            callbacks: { finish: "" }
+        };
+
+        // Mendapatkan token Snap dari Midtrans
+        const response = await axios.post(
+            'https://app.sandbox.midtrans.com/snap/v1/transactions',
+            parameter,
+            {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json',
+                    'Authorization': `Basic ${Buffer.from(process.env.MIDTRANS_SERVER_KEY).toString('base64')}`
+                }
+            }
+        );
+        console.log('Token Snap diperoleh dari API Midtrans');
+
+        const snapToken = response.data.token;
+        const midtransUrl = response.data.redirect_url;
+
+        // Insert record pembayaran ke tabel payments
+        const result = await pool.query(
+            `INSERT INTO payments (order_id, status, user_id, snap_token, midtrans_url, expired_date, invoice_number)
+             VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+            [order_id, 'Pending', user_id, snapToken, midtransUrl, expiredDate, invoiceNumber]
+        );
+        console.log('Record pembayaran baru dimasukkan ke tabel payments');
+
+        await pool.query('COMMIT'); // Commit transaksi jika berhasil
+
+        res.json({
+            data: {
+                snapToken: snapToken,
+                midtransUrl: midtransUrl,
+                expiredDate: expiredDate,
+                invoiceNumber: invoiceNumber
+            },
+            message: 'Transaksi berhasil dibuat dan token Snap berhasil diperoleh'
+        });
+
+    } catch (error) {
+        await pool.query('ROLLBACK'); // Rollback transaksi jika ada error
+        console.error(`Gagal membuat pembayaran untuk order_number ${order_number}:`, error);
+        if (error.response) {
+            console.error('Error API Midtrans:', error.response.data);
+        }
+        res.status(500).json({ message: 'Gagal membuat snapshot', error });
+    }
+};
