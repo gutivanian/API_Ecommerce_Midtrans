@@ -1,5 +1,4 @@
 const pool = require('../config/db');
-const midtransClient = require('midtrans-client');
 const { convertToBase35 } = require('../utils/utils'); // Import fungsi konversi user_id
 const axios = require('axios');
 
